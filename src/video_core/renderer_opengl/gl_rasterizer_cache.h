@@ -82,18 +82,6 @@ struct TextureCubeConfig {
 
 namespace std {
 template <>
-struct hash<OpenGL::HostTextureTag> {
-    std::size_t operator()(const OpenGL::HostTextureTag& tag) const noexcept {
-        std::size_t hash = 0;
-        boost::hash_combine(hash, tag.format_tuple.format);
-        boost::hash_combine(hash, tag.format_tuple.internal_format);
-        boost::hash_combine(hash, tag.width);
-        boost::hash_combine(hash, tag.height);
-        return hash;
-    }
-};
-
-template <>
 struct hash<OpenGL::TextureCubeConfig> {
     std::size_t operator()(const OpenGL::TextureCubeConfig& config) const noexcept {
         std::size_t hash = 0;
@@ -175,7 +163,6 @@ class RasterizerCacheOpenGL;
 
 struct CachedSurface : SurfaceParams, std::enable_shared_from_this<CachedSurface> {
     CachedSurface(RasterizerCacheOpenGL& owner) : owner{owner} {}
-    ~CachedSurface();
 
     bool CanFill(const SurfaceParams& dest_surface, SurfaceInterval fill_interval) const;
     bool CanCopy(const SurfaceParams& dest_surface, SurfaceInterval copy_interval) const;
@@ -380,11 +367,8 @@ private:
     std::recursive_mutex mutex;
 
 public:
-    OGLTexture AllocateSurfaceTexture(const FormatTuple& format_tuple, u32 width, u32 height);
-
     std::unique_ptr<TextureFilterer> texture_filterer;
     std::unique_ptr<FormatReinterpreterOpenGL> format_reinterpreter;
     std::unique_ptr<TextureDownloaderES> texture_downloader_es;
 };
-
 } // namespace OpenGL

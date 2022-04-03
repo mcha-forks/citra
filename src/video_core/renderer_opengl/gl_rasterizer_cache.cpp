@@ -244,21 +244,13 @@ static constexpr std::array<void (*)(u32, u32, u8*, PAddr, PAddr, PAddr), 18> gl
 };
 
 // Allocate an uninitialized texture of appropriate size and format for the surface
-OGLTexture RasterizerCacheOpenGL::AllocateSurfaceTexture(const FormatTuple& format_tuple, u32 width,
-                                                         u32 height) {
-    auto recycled_tex = host_texture_recycler.find({format_tuple, width, height});
-    if (recycled_tex != host_texture_recycler.end()) {
-        OGLTexture texture = std::move(recycled_tex->second);
-        host_texture_recycler.erase(recycled_tex);
-        return texture;
-    }
-    OGLTexture texture;
-    texture.Create();
-
+static void AllocateSurfaceTexture(GLuint texture, const FormatTuple& format_tuple, u32 width,
+                                   u32 height) {
     OpenGLState cur_state = OpenGLState::GetCurState();
+
     // Keep track of previous texture bindings
     GLuint old_tex = cur_state.texture_units[0].texture_2d;
-    cur_state.texture_units[0].texture_2d = texture.handle;
+    cur_state.texture_units[0].texture_2d = texture;
     cur_state.Apply();
     glActiveTexture(GL_TEXTURE0);
 
@@ -279,8 +271,6 @@ OGLTexture RasterizerCacheOpenGL::AllocateSurfaceTexture(const FormatTuple& form
     // Restore previous texture bindings
     cur_state.texture_units[0].texture_2d = old_tex;
     cur_state.Apply();
-
-    return texture;
 }
 
 static void AllocateTextureCube(GLuint texture, const FormatTuple& format_tuple, u32 width) {
@@ -446,17 +436,6 @@ static bool FillSurface(const Surface& surface, const u8* fill_data,
         glClearBufferfi(GL_DEPTH_STENCIL, 0, value_float, value_int);
     }
     return true;
-}
-
-CachedSurface::~CachedSurface() {
-    if (texture.handle) {
-        auto tag = is_custom ? HostTextureTag{GetFormatTuple(PixelFormat::RGBA8),
-                                              custom_tex_info.width, custom_tex_info.height}
-                             : HostTextureTag{GetFormatTuple(pixel_format), GetScaledWidth(),
-                                              GetScaledHeight()};
-
-        owner.host_texture_recycler.emplace(tag, std::move(texture));
-    }
 }
 
 bool CachedSurface::CanFill(const SurfaceParams& dest_surface,
@@ -798,11 +777,12 @@ void CachedSurface::UploadGLTexture(Common::Rectangle<u32> rect, GLuint read_fb_
         x0 = 0;
         y0 = 0;
 
+        unscaled_tex.Create();
         if (is_custom) {
-            unscaled_tex = owner.AllocateSurfaceTexture(
-                GetFormatTuple(PixelFormat::RGBA8), custom_tex_info.width, custom_tex_info.height);
+            AllocateSurfaceTexture(unscaled_tex.handle, GetFormatTuple(PixelFormat::RGBA8),
+                                   custom_tex_info.width, custom_tex_info.height);
         } else {
-            unscaled_tex = owner.AllocateSurfaceTexture(tuple, rect.GetWidth(), rect.GetHeight());
+            AllocateSurfaceTexture(unscaled_tex.handle, tuple, rect.GetWidth(), rect.GetHeight());
         }
         target_tex = unscaled_tex.handle;
     }
@@ -817,8 +797,8 @@ void CachedSurface::UploadGLTexture(Common::Rectangle<u32> rect, GLuint read_fb_
     ASSERT(stride * GetGLBytesPerPixel(pixel_format) % 4 == 0);
     if (is_custom) {
         if (res_scale == 1) {
-            texture = owner.AllocateSurfaceTexture(GetFormatTuple(PixelFormat::RGBA8),
-                                                   custom_tex_info.width, custom_tex_info.height);
+            AllocateSurfaceTexture(texture.handle, GetFormatTuple(PixelFormat::RGBA8),
+                                   custom_tex_info.width, custom_tex_info.height);
             cur_state.texture_units[0].texture_2d = texture.handle;
             cur_state.Apply();
         }
@@ -896,9 +876,11 @@ void CachedSurface::DownloadGLTexture(const Common::Rectangle<u32>& rect, GLuint
         scaled_rect.right *= res_scale;
         scaled_rect.bottom *= res_scale;
 
+        OGLTexture unscaled_tex;
+        unscaled_tex.Create();
+
         Common::Rectangle<u32> unscaled_tex_rect{0, rect.GetHeight(), rect.GetWidth(), 0};
-        OGLTexture unscaled_tex =
-            owner.AllocateSurfaceTexture(tuple, rect.GetWidth(), rect.GetHeight());
+        AllocateSurfaceTexture(unscaled_tex.handle, tuple, rect.GetWidth(), rect.GetHeight());
         BlitTextures(texture.handle, scaled_rect, unscaled_tex.handle, unscaled_tex_rect, type,
                      read_fb_handle, draw_fb_handle);
 
@@ -1742,12 +1724,15 @@ bool RasterizerCacheOpenGL::ValidateByReinterpretation(const Surface& surface,
             if (!texture_filterer->IsNull() && reinterpret_surface->res_scale == 1 &&
                 surface->res_scale == resolution_scale_factor) {
                 // The destination surface is either a framebuffer, or a filtered texture.
+                OGLTexture tmp_tex;
+                tmp_tex.Create();
                 // Create an intermediate surface to convert to before blitting to the
                 // destination.
                 Common::Rectangle<u32> tmp_rect{0, dest_rect.GetHeight() / resolution_scale_factor,
                                                 dest_rect.GetWidth() / resolution_scale_factor, 0};
-                OGLTexture tmp_tex = AllocateSurfaceTexture(
-                    GetFormatTuple(reinterpreter->first.dst_format), tmp_rect.right, tmp_rect.top);
+                AllocateSurfaceTexture(tmp_tex.handle,
+                                       GetFormatTuple(reinterpreter->first.dst_format),
+                                       tmp_rect.right, tmp_rect.top);
                 reinterpreter->second->Reinterpret(reinterpret_surface->texture.handle, src_rect,
                                                    read_framebuffer.handle, tmp_tex.handle,
                                                    tmp_rect, draw_framebuffer.handle);
@@ -1866,9 +1851,9 @@ void RasterizerCacheOpenGL::InvalidateRegion(PAddr addr, u32 size, const Surface
             cached_surface->invalid_regions.insert(interval);
             cached_surface->InvalidateAllWatcher();
 
-            // If the surface has no salvageable data it should be removed from the cache to avoid
-            // clogging the data structure
-            if (cached_surface->IsSurfaceFullyInvalid()) {
+            // Remove only "empty" fill surfaces to avoid destroying and recreating OGL textures
+            if (cached_surface->type == SurfaceType::Fill &&
+                cached_surface->IsSurfaceFullyInvalid()) {
                 remove_surfaces.emplace(cached_surface);
             }
         }
@@ -1901,11 +1886,12 @@ Surface RasterizerCacheOpenGL::CreateSurface(const SurfaceParams& params) {
     Surface surface = std::make_shared<CachedSurface>(*this);
     static_cast<SurfaceParams&>(*surface) = params;
 
-    surface->invalid_regions.insert(surface->GetInterval());
+    surface->texture.Create();
 
-    surface->texture =
-        AllocateSurfaceTexture(GetFormatTuple(surface->pixel_format), surface->GetScaledWidth(),
-                               surface->GetScaledHeight());
+    surface->gl_buffer.resize(0);
+    surface->invalid_regions.insert(surface->GetInterval());
+    AllocateSurfaceTexture(surface->texture.handle, GetFormatTuple(surface->pixel_format),
+                           surface->GetScaledWidth(), surface->GetScaledHeight());
 
     return surface;
 }
